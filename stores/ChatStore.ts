@@ -9,8 +9,21 @@ import { notifications } from "@mantine/notifications";
 import { getModelInfo } from "./Model";
 import { assertIsError } from "@/stores/OpenAI";
 import axios from "axios";
+import { NextRouter } from "next/router";
 
 type APIState = "idle" | "loading" | "error";
+type AudioState = "idle" | "recording" | "transcribing" | "processing";
+
+const excludeFromState = [
+  "currentAbortController",
+  "recorder",
+  "recorderTimeout",
+  "submitNextAudio",
+  "audioChunks",
+  "ttsID",
+  "ttsText",
+  "activeChatId",
+];
 
 interface SettingsForm {
   model: string;
@@ -22,17 +35,19 @@ interface SettingsForm {
   presence_penalty: number;
   frequency_penalty: number;
   logit_bias: string;
-  // non-model stuff
-  push_to_talk_key: string;
   auto_detect_language: boolean;
   spoken_language: string;
   spoken_language_code: string;
+  voice_id: string;
   auto_title: boolean;
+  // non-model stuff
+  push_to_talk_key: string;
 }
 
 interface ChatState {
   apiState: APIState;
   apiKey: string | undefined;
+  apiKey11Labs: string | undefined;
   chats: Chat[];
   activeChatId: string | undefined;
   colorScheme: "light" | "dark";
@@ -41,18 +56,28 @@ interface ChatState {
   defaultSettings: SettingsForm;
   navOpened: boolean;
   pushToTalkMode: boolean;
+  recorder: MediaRecorder | undefined;
+  recorderTimeout: ReturnType<typeof setTimeout> | undefined;
+  submitNextAudio: boolean;
+  audioState: AudioState;
+  audioChunks: BlobPart[];
+  playerMode: boolean;
   editingMessage: Message | undefined;
+  ttsID: string | undefined;
+  ttsText: string | undefined;
+  showTextDuringPTT: boolean;
 
-  addChat: (title?: string) => void;
+  addChat: (router: NextRouter) => void;
   deleteChat: (id: string) => void;
   clearChats: () => void;
-  setActiveChat: (id: string) => void;
+  setActiveChatId: (id: string | undefined) => void;
   pushMessage: (message: Message) => void;
   delMessage: (message: Message) => void;
-  submitMessage: (message: Message) => void;
+  submitMessage: (message: Message) => Promise<void>;
   updateMessage: (message: Message) => void;
   setColorScheme: (scheme: "light" | "dark") => void;
   setApiKey: (key: string) => void;
+  setApiKey11Labs: (key: string) => void;
   setApiState: (state: APIState) => void;
   updateSettingsForm: (settings: ChatState["settingsForm"]) => void;
   abortCurrentRequest: () => void;
@@ -60,9 +85,15 @@ interface ChatState {
   setChosenCharacter: (name: string) => void;
   setNavOpened: (opened: boolean) => void;
   setPushToTalkMode: (mode: boolean) => void;
+  setPlayerMode: (mode: boolean) => void;
   setEditingMessage: (id: Message | undefined) => void;
   regenerateAssistantMessage: (message: Message) => void;
   submitAudio: (newMessage: Message, audio: Blob) => Promise<void>;
+  sendAudioData: (audio: Blob) => Promise<void>;
+  startRecording: () => Promise<void>;
+  stopRecording: (submit: boolean) => Promise<void>;
+  destroyRecorder: () => Promise<void>;
+  setTtsText: (text: string | undefined) => void;
 }
 
 const defaultSettings = {
@@ -78,63 +109,64 @@ const defaultSettings = {
   auto_detect_language: false,
   spoken_language: "English (en)",
   spoken_language_code: "en",
+  voice_id: "21m00Tcm4TlvDq8ikWAM",
   auto_title: true,
   // non-model stuff
   push_to_talk_key: "KeyC",
 };
 
-const initialChatId = uuidv4();
-
 const initialState = {
   apiState: "idle" as APIState,
-  apiKey: undefined,
-  chats: [
-    {
-      id: initialChatId,
-      messages: [],
-    },
-  ],
-  activeChatId: initialChatId,
+  apiKey: process.env.NEXT_PUBLIC_OPENAI_API_KEY || undefined,
+  apiKey11Labs: process.env.NEXT_PUBLIC_11LABS_API_KEY || undefined,
+  chats: [],
+  activeChatId: undefined,
   colorScheme: "light" as "light" | "dark",
   currentAbortController: undefined,
   settingsForm: defaultSettings,
   defaultSettings: defaultSettings,
   navOpened: false,
+  playerMode: false,
   pushToTalkMode: false,
   editingMessage: undefined,
+  recorder: undefined,
+  recorderTimeout: undefined,
+  submitNextAudio: true,
+  audioState: "idle" as AudioState,
+  audioChunks: [],
+  showTextDuringPTT: false,
+  ttsID: undefined,
+  ttsText: undefined,
 };
 
 export const useChatStore = create<ChatState>()(
   persist(
     (set, get) => ({
       ...initialState,
-      clearChats: () => set(() => ({ chats: [], activeChatId: undefined })),
+      clearChats: () => set(() => ({ chats: [] })),
       deleteChat: (id: string) =>
         set((state) => ({
           chats: state.chats.filter((chat) => chat.id !== id),
-          activeChatId:
-            state.activeChatId === id
-              ? state.chats[state.chats.length - 1].id
-              : state.activeChatId,
         })),
-      addChat: (title?: string) => {
+      addChat: (router: NextRouter) => {
         window.scrollTo(0, 0);
-        return set((state) => {
-          const id = uuidv4();
-          return {
-            chats: [
-              ...state.chats,
-              {
-                id,
-                title: title,
-                messages: [],
-              },
-            ],
-            activeChatId: id,
-          };
-        });
+        const id = uuidv4();
+
+        set((state) => ({
+          activeChatId: id,
+          chats: [
+            ...state.chats,
+            {
+              id,
+              title: undefined,
+              messages: [],
+            },
+          ],
+        }));
+        router.push(`/chat/${id}`);
       },
-      setActiveChat: (id: string) => set((state) => ({ activeChatId: id })),
+      setActiveChatId: (id: string | undefined) =>
+        set(() => ({ activeChatId: id })),
       updateMessage: (message: Message) => {
         const chat = getChatById(get().chats, get().activeChatId);
         if (chat === undefined) {
@@ -147,7 +179,7 @@ export const useChatStore = create<ChatState>()(
           }),
         }));
       },
-      pushMessage: async (message: Message) => {
+      pushMessage: (message: Message) => {
         const chat = getChatById(get().chats, get().activeChatId);
         if (chat === undefined) {
           console.error("Chat not found");
@@ -159,7 +191,7 @@ export const useChatStore = create<ChatState>()(
           }),
         }));
       },
-      delMessage: async (message: Message) => {
+      delMessage: (message: Message) => {
         const chat = getChatById(get().chats, get().activeChatId);
         if (chat === undefined) {
           console.error("Chat not found");
@@ -177,11 +209,14 @@ export const useChatStore = create<ChatState>()(
           console.error("Message is empty");
           return;
         }
-        const chat = get().chats.find((c) => c.id === get().activeChatId);
+
+        const activeChatId = get().activeChatId;
+        const chat = get().chats.find((c) => c.id === activeChatId!);
         if (chat === undefined) {
           console.error("Chat not found");
           return;
         }
+        console.log("chat", chat.id);
 
         // If this is an existing message, remove all the messages after it
         const index = chat.messages.findIndex((m) => m.id === message.id);
@@ -211,7 +246,7 @@ export const useChatStore = create<ChatState>()(
         // Add the assistant's response
         set((state) => ({
           chats: state.chats.map((c) => {
-            if (c.id === chat.id) {
+            if (c.id === state.activeChatId) {
               c.messages.push({
                 id: assistantMsgId,
                 content: "",
@@ -271,6 +306,10 @@ export const useChatStore = create<ChatState>()(
           (tokensUsed) => {
             set((state) => ({
               apiState: "idle",
+              ttsID: assistantMsgId,
+              ttsText: state.chats
+                .find((c) => c.id === chat.id)
+                ?.messages.find((m) => m.id === assistantMsgId)?.content,
               chats: updateChatMessages(state.chats, chat.id, (messages) => {
                 const assistantMessage = messages.find(
                   (m) => m.id === assistantMsgId
@@ -359,6 +398,7 @@ export const useChatStore = create<ChatState>()(
       setColorScheme: (scheme: "light" | "dark") =>
         set((state) => ({ colorScheme: scheme })),
       setApiKey: (key: string) => set((state) => ({ apiKey: key })),
+      setApiKey11Labs: (key: string) => set((state) => ({ apiKey11Labs: key })),
       setApiState: (apiState: APIState) => set((state) => ({ apiState })),
       updateSettingsForm: (settingsForm: ChatState["settingsForm"]) =>
         set((state) => ({ settingsForm })),
@@ -391,8 +431,132 @@ export const useChatStore = create<ChatState>()(
       setNavOpened: (navOpened: boolean) => set((state) => ({ navOpened })),
       setPushToTalkMode: (pushToTalkMode: boolean) =>
         set((state) => ({ pushToTalkMode })),
+      setPlayerMode: (playerMode: boolean) => {
+        if (playerMode && !get().apiKey11Labs) {
+          notifications.show({
+            message:
+              'Please enter your ElevenLabs API key in "API Keys" to enable TTS',
+          });
+          return;
+        }
+        set((state) => ({ playerMode }));
+      },
       setEditingMessage: (editingMessage: Message | undefined) =>
         set((state) => ({ editingMessage })),
+
+      sendAudioData: async (blob: Blob) => {
+        const { audioChunks, pushMessage, setApiState, submitAudio } = get();
+        const newMessage = {
+          id: uuidv4(),
+          content: "",
+          role: "user",
+        } as Message;
+
+        pushMessage(newMessage);
+        setApiState("loading");
+
+        console.log("Sending audio data to OpenAI...", audioChunks.length);
+
+        await submitAudio(newMessage, blob);
+      },
+      startRecording: async () => {
+        const { audioChunks, sendAudioData, destroyRecorder } = get();
+        let recorder = get().recorder;
+        console.log("start");
+        set((state) => ({ audioChunks: [] }));
+        clearTimeout(get().recorderTimeout);
+
+        const onRecordingDataAvailable = (e: BlobEvent) => {
+          console.log("dataavailable", e.data.size);
+          set((state) => ({ audioChunks: [...state.audioChunks, e.data] }));
+        };
+
+        const onRecordingStop = () => {
+          const submitNextAudio = get().submitNextAudio;
+          console.log("stop, submit=", submitNextAudio);
+          const cleanup = () => {
+            set((state) => ({
+              audioState: "idle",
+              audioChunks: [],
+            }));
+            set((state) => ({
+              recorderTimeout: setTimeout(() => {
+                destroyRecorder();
+              }, 30_000),
+            }));
+          };
+
+          if (submitNextAudio) {
+            const blob = new Blob(get().audioChunks, { type: "audio/webm" });
+
+            sendAudioData(blob).then(cleanup, cleanup);
+          } else {
+            cleanup();
+          }
+        };
+
+        if (!recorder) {
+          try {
+            const stream = await navigator.mediaDevices.getUserMedia({
+              audio: true,
+            });
+            let options = { mimeType: "audio/webm" };
+
+            const workerOptions = {
+              WebMOpusEncoderWasmPath:
+                "https://cdn.jsdelivr.net/npm/opus-media-recorder@latest/WebMOpusEncoder.wasm",
+            };
+
+            // @ts-ignore
+            recorder = new window.OpusMediaRecorder(
+              stream,
+              options,
+              workerOptions
+            ) as MediaRecorder;
+
+            recorder.addEventListener(
+              "dataavailable",
+              onRecordingDataAvailable
+            );
+            recorder.addEventListener("stop", onRecordingStop);
+
+            set((state) => ({ recorder }));
+          } catch (err) {
+            console.error("Error initializing recorder:", err);
+            return;
+          }
+        }
+
+        console.log("Starting recording...", recorder);
+        recorder.start(1_000);
+        set((state) => ({ audioState: "recording" }));
+      },
+      stopRecording: async (submit: boolean) => {
+        console.log("Stopping recording... submit=", submit);
+        const { audioChunks, recorder, submitNextAudio } = get();
+
+        set((state) => ({ submitNextAudio: submit }));
+
+        if (recorder) {
+          // Set immediately since the ev handler takes some time
+          if (submit) {
+            set((state) => ({ audioState: "transcribing" }));
+          } else {
+            set((state) => ({ audioState: "idle" }));
+          }
+          if (recorder.state !== "inactive") {
+            recorder.stop();
+          }
+        }
+      },
+      destroyRecorder: async () => {
+        const { audioChunks, recorder } = get();
+
+        if (recorder) {
+          recorder.stream.getTracks().forEach((i) => i.stop());
+          set((state) => ({ recorder: undefined }));
+        }
+      },
       submitAudio: async (newMessage: Message, blob: Blob) => {
         const apiUrl = "https://api.openai.com/v1/audio/transcriptions";
 
@@ -471,10 +635,17 @@ export const useChatStore = create<ChatState>()(
           get().submitMessage(prevMsg);
         }
       },
+      setTtsText: (ttsText: string | undefined) =>
+        set((state) => ({ ttsText })),
     }),
     {
       name: "chat-store-v23",
-      partialize: (state) => state,
+      partialize: (state) =>
+        Object.fromEntries(
+          Object.entries(state).filter(
+            ([key]) => !excludeFromState.includes(key)
+          )
+        ),
     }
   )
 );
